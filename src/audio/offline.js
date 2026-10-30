@@ -11,10 +11,11 @@ const SLICE = 0.1; // seconds scheduled per step of the render, like the live lo
 
 // session: a serialized session. prepare(state) may adjust it before playing.
 // onProgress(0..1) is called as the render goes. stem: see AudioEngine.stem.
-export async function renderSession(session, { startBar = 1, bars = 16, sampleRate = 48000, tail = 1, prepare, onProgress, stem = null } = {}) {
+export async function renderSession(session, { startBar = 1, bars = 16, sampleRate = 48000, tail = 1, prepare, onProgress, stem = null, linear = false } = {}) {
   const state = new State();
   const engine = new AudioEngine(state);
   engine.stem = stem;
+  engine.linear = linear;
   const clock = new Clock(state, engine);
   // Controls register parameter defaults: build the rack before loading.
   new Rack(state, { clock, engine, files: {} });

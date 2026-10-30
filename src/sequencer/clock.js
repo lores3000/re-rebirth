@@ -11,7 +11,7 @@ import { DEVICE_IDS } from '../state.js';
 const LOOKAHEAD = 0.12; // seconds scheduled ahead
 const RECENT = 2; // seconds of scheduled steps kept for nearestStep
 const INTERVAL = 25; // ms between scheduler runs
-const START_DELAY = 0.05;
+export const START_DELAY = 0.05;
 
 // Song-file controls only; local monitoring (mute, master) isn't recorded.
 const UNRECORDED = /^(master\.|song\.|mixer\.(master|delayReturn)|mixer\.\w+\.mute)/;

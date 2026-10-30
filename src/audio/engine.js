@@ -124,6 +124,9 @@ export class AudioEngine {
     // Offline stem renders: a channel id (that channel alone, dry) or 'delay' (only
     // the echoes of every channel). Null plays everything.
     this.stem = null;
+    // Offline renders for a game engine that mixes the stems itself: no master
+    // limiter or soft clip, so stems add up to the mix at any level.
+    this.linear = false;
     this.liveHeld = Object.fromEntries(BASS_IDS.map((id) => [id, false]));
     // The song's sound model: 0 "ReBirth 2.0", 1 "Vintage ReBirth" (see bass-voice.js).
     state.define('song.vintage', 0);
@@ -158,7 +161,8 @@ export class AudioEngine {
     this.masterInserts = new InsertChain(ctx, this.masterBus, this.masterFader);
     // Stems go through the same limiter and clipper: below their thresholds both
     // are linear (the limiter's make-up gain included), so stems add up to the mix.
-    this.masterFader.connect(this.volume).connect(limiter).connect(clipper).connect(ctx.destination);
+    if (this.linear) this.masterFader.connect(this.volume).connect(ctx.destination);
+    else this.masterFader.connect(this.volume).connect(limiter).connect(clipper).connect(ctx.destination);
 
     this.delay = createDelay(ctx);
     this.delayReturn = ctx.createGain();

@@ -13,11 +13,13 @@
     import {pcm16, renderSession} from '/src/audio/offline.js';
     import {isRbs, parseRbs} from '/src/song/rbs.js';
     import {DEVICE_IDS} from '/src/state.js';
+    import {START_DELAY} from '/src/sequencer/clock.js';
 
     // Returns interleaved 16-bit PCM as base64 (keeps the page→node transfer small).
     // `set`: { paramKey: value } pinned for the whole render (its automation is dropped).
     // `noTrim`: ignore CHANNEL_TRIM_DB (calibrate voices against references, not the mix taste).
-    window.renderSong = async ({url, startBar = 1, bars = 16, sampleRate = 48000, solo = null, set = {}, noTrim = false, tail = 1}) => {
+    // `stem`: a channel id (that channel alone, dry) or 'delay' (every channel's echoes), as EXPORT's stems.
+    window.renderSong = async ({url, startBar = 1, bars = 16, sampleRate = 48000, solo = null, set = {}, noTrim = false, tail = 1, stem = null, linear = false, trimLead = false}) => {
       if (noTrim) for (const id of Object.keys(CHANNEL_TRIM_DB)) CHANNEL_TRIM_DB[id] = 0;
       const buffer = await (await fetch(url)).arrayBuffer();
       const session = isRbs(buffer) ? parseRbs(buffer) : JSON.parse(new TextDecoder().decode(buffer));
@@ -37,12 +39,30 @@
           state.set(key, value);
         }
       };
-      const {buffer: out, tempo} = await renderSession(session, {startBar, bars, sampleRate, tail, prepare});
-      const bytes = new Uint8Array(pcm16(out).buffer);
+      const {buffer: rendered, tempo} = await renderSession(session, {startBar, bars, sampleRate, tail: tail + (trimLead ? START_DELAY : 0), prepare, stem, linear});
+      // The clock starts START_DELAY in, as live (starting at 0 plays the first notes
+      // before the knobs settle); `trimLead` cuts it so bar 1 is on the first sample.
+      const out = trimLead ? lead(rendered, Math.round(START_DELAY * sampleRate)) : rendered;
+      // Linear renders can pass full scale: 32-bit float keeps them unclipped.
+      const bytes = new Uint8Array(linear ? interleaved(out).buffer : pcm16(out).buffer);
       let bin = '';
       for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-      return {sampleRate, channels: 2, data: btoa(bin), tempo};
+      return {sampleRate, channels: 2, data: btoa(bin), tempo, float: linear};
     };
+    function lead(buffer, n) {
+      const out = new AudioBuffer({length: buffer.length - n, numberOfChannels: 2, sampleRate: buffer.sampleRate});
+      for (let c = 0; c < 2; c++) out.copyToChannel(buffer.getChannelData(c).subarray(n), c);
+      return out;
+    }
+    function interleaved(buffer) {
+      const [l, r] = [buffer.getChannelData(0), buffer.getChannelData(1)];
+      const out = new Float32Array(l.length * 2);
+      for (let i = 0; i < l.length; i++) {
+        out[2 * i] = l[i];
+        out[2 * i + 1] = r[i];
+      }
+      return out;
+    }
     window.renderReady = true;
   </script>
 </body>

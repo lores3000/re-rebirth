@@ -18,6 +18,17 @@ function env(v, peak, decay, attack = 0.0015, at = v.t) {
   return g;
 }
 
+// ReBirth's sample voices hold the sample at full gain for `hold`, then fade fast
+// (0.998 per sample pair: ~23 ms). A gain stage of its own after the voice's
+// envelope: more events on one gain param spiked the attack in long renders.
+const HOLD_FADE = 2 / 44100 / -Math.log(0.998);
+function holdGate(v, hold) {
+  const g = v.ctx.createGain();
+  g.gain.setValueAtTime(1, v.t);
+  g.gain.setTargetAtTime(0, v.t + hold, HOLD_FADE);
+  return g;
+}
+
 // A fast drop to `tail` (fraction of the peak) followed by a long decay: metal
 // voices ring on long after their bright attack.
 function env2(v, peak, fast, tail, slow, attack = 0.001) {
@@ -115,7 +126,8 @@ function kick(v, { base, sweep, sweepTime, settle, decay, level, click, clickHz 
 
 // tones: [hz, level, decay, fast?] drum heads, sine, falling from hz * sweep over
 // 20 ms; `fast` adds a quick drop to a fifth of the level before the decay.
-function snare(v, { tones, sweep = 1, noiseHp, noiseLp, noiseDecay, noiseLevel }) {
+// noiseHold: the noise as a ReBirth sample voice, cut by holdGate after noiseHold s.
+function snare(v, { tones, sweep = 1, noiseHp, noiseLp, noiseDecay, noiseLevel, noiseHold = null }) {
   for (const [hz, level, decay, fast] of tones) {
     const o = osc(v, 'sine', hz * sweep);
     o.frequency.exponentialRampToValueAtTime(hz, v.t + 0.02);
@@ -123,8 +135,10 @@ function snare(v, { tones, sweep = 1, noiseHp, noiseLp, noiseDecay, noiseLevel }
     run(v, o, decay + 0.05);
   }
   const n = noise(v);
-  chain(n, filter(v, 'highpass', noiseHp), filter(v, 'lowpass', noiseLp), env(v, noiseLevel, noiseDecay), v.out);
-  run(v, n, noiseDecay + 0.05);
+  const out = chain(n, filter(v, 'highpass', noiseHp), filter(v, 'lowpass', noiseLp), env(v, noiseLevel, noiseDecay));
+  if (noiseHold === null) out.connect(v.out);
+  else chain(out, holdGate(v, noiseHold), v.out);
+  run(v, n, (noiseHold === null ? noiseDecay : Math.min(noiseDecay, noiseHold + 0.1)) + 0.05);
 }
 
 // click: a short broadband noise burst on the attack.
@@ -186,11 +200,14 @@ function clap(v, level, hz, tail, q = 1.6, tailLevel = 0.8, hp = 600) {
 
 // body: level of the square bank's low partials leaking past the filters,
 // heard as a metallic ring around 400 Hz on the 808 hats.
-function hat(v, { level, decay, scale = 1, bp = 10000, hp = 7000, lp = 20000, noiseMix = 0, metalMix = 1, body = 0, bodyDecay = 0.06, choke = false, chokeable = false }) {
+// hold: a ReBirth sample voice, `decay` (-60 dB) as the sample's own fade, cut by
+// holdGate after `hold` seconds.
+function hat(v, { level, decay, hold = null, scale = 1, bp = 10000, hp = 7000, lp = 20000, noiseMix = 0, metalMix = 1, body = 0, bodyDecay = 0.06, choke = false, chokeable = false }) {
   const out = env(v, level, decay, 0.0008);
+  const length = hold === null ? decay : Math.min(decay, hold + 0.1);
   const mg = v.ctx.createGain();
   mg.gain.value = metalMix;
-  const source = metal(v, scale, decay + 0.05);
+  const source = metal(v, scale, length + 0.05);
   chain(source, filter(v, 'bandpass', bp, 1), filter(v, 'highpass', hp), filter(v, 'lowpass', lp), mg, out);
   if (body) chain(source, filter(v, 'bandpass', 400, 2), env(v, level * body, bodyDecay, 0.0008), out);
   if (noiseMix) {
@@ -198,11 +215,12 @@ function hat(v, { level, decay, scale = 1, bp = 10000, hp = 7000, lp = 20000, no
     const ng = v.ctx.createGain();
     ng.gain.value = noiseMix;
     chain(n, filter(v, 'highpass', hp), filter(v, 'lowpass', lp), ng, out);
-    run(v, n, decay + 0.05);
+    run(v, n, length + 0.05);
   }
   // The open hat goes through a separate gain so a closed hat can cut it off.
   const gate = v.ctx.createGain();
-  chain(out, gate, v.out);
+  if (hold === null) chain(out, gate, v.out);
+  else chain(out, holdGate(v, hold), gate, v.out);
   // The gate is never automated before a choke, so pin its value explicitly first.
   if (choke && v.kit.openHat) {
     v.kit.openHat.gain.setValueAtTime(1, v.t);
@@ -212,15 +230,27 @@ function hat(v, { level, decay, scale = 1, bp = 10000, hp = 7000, lp = 20000, no
 }
 
 // fast/tail: an optional quick initial drop before the main decay.
-function cymbal(v, { level, decay, scale, hp, bp, noiseMix, fast = 0, tail = 1 }) {
+// lp: an optional lowpass on the result. fade: a ReBirth voice decay (time
+// constant, s) on top of the sample's own envelope, as a gain stage of its own.
+function cymbal(v, { level, decay, scale, hp, bp, noiseMix, fast = 0, tail = 1, lp = null, fade = null }) {
   const out = fast ? env2(v, level, fast, tail, decay) : env(v, level, decay, 0.001);
-  chain(metal(v, scale, decay + 0.05), filter(v, 'bandpass', bp, 0.6), filter(v, 'highpass', hp), out, v.out);
+  const length = fade === null ? decay : Math.min(decay, fade * 7);
+  let last = out;
+  if (lp !== null) last = chain(out, filter(v, 'lowpass', lp));
+  if (fade !== null) {
+    const g = v.ctx.createGain();
+    g.gain.setValueAtTime(1, v.t);
+    g.gain.setTargetAtTime(0, v.t, fade);
+    last = chain(last, g);
+  }
+  last.connect(v.out);
+  chain(metal(v, scale, length + 0.05), filter(v, 'bandpass', bp, 0.6), filter(v, 'highpass', hp), out);
   if (noiseMix) {
     const n = noise(v);
     const ng = v.ctx.createGain();
     ng.gain.value = noiseMix;
     chain(n, filter(v, 'highpass', hp), ng, out);
-    run(v, n, decay + 0.05);
+    run(v, n, length + 0.05);
   }
 }
 
@@ -233,10 +263,13 @@ function shaker(v, { level, decay, hp }) {
 
 // Voices with a switch (808 toms / congas etc.): `alt` param on picks the second.
 const pick = (standard, alternate) => (v, P) => (P('alt') >= 0.5 ? alternate : standard)(v, P);
-const tom808 = (hz, decay, level) => (v, P) => tom(v, { hz: hz * (0.8 + P('tuning') * 0.5), decay, level: lvl(P('level')) * v.acc * level, sweep: 1.04, sweepTime: 0.02, attack: 0.005 });
+// Levels x1.7: 4-5 dB under OpenRB-338's renders of ReBirth.
+const tom808 = (hz, decay, level) => (v, P) => tom(v, { hz: hz * (0.8 + P('tuning') * 0.5), decay, level: lvl(P('level')) * v.acc * level * 1.7, sweep: 1.04, sweepTime: 0.02, attack: 0.005 });
 // Knob response that stays close to linear below ~0.8 and stretches the top end
 // (808 cymbal and open hat decays run several seconds at 127).
 const stretch = (d, base, lin, top) => base + d * lin + d ** 8 * top;
+
+const OH808_SAMPLE = 0.55;
 
 // 808 voices fitted to isolated hits in ReBirth exports: a test song that plays
 // every voice alone with all effects off, and earlier songs for knob ranges.
@@ -246,9 +279,14 @@ const R808 = {
   bd: ['bd', (v, P) => kick(v, { base: 50 + P('tone') * 6, sweep: 1.5, sweepTime: 0.03, decay: 0.12 * 4.25 ** (2 * P('decay')), level: lvl(P('level')) * v.acc * 1.4, click: P('tone') * 0.1 })],
   // Two pure drum heads, 179 and 332 Hz; tone raises the upper one from -15 dB
   // (tone 0) to +7 dB (tone 127). Snappy adds noise.
+  // Levels fitted to OpenRB-338 renders of ReBirth: tone picks one of five head
+  // samples (louder at the ends), a weaker partial near 520 Hz, and snappy adds a
+  // broadband noise sample by snappy squared, whatever the tone.
   sd: ['sd', (v, P) => {
     const L = lvl(P('level')) * v.acc;
-    snare(v, { tones: [[179, L * 0.8, 0.2], [332, L * 0.8 * 10 ** ((-15 + 22 * P('tone')) / 20), 0.07]], noiseHp: 1800, noiseLp: 6000 + P('tone') * 6000, noiseDecay: 0.18, noiseLevel: L * P('snappy') });
+    const t = P('tone');
+    const head = L * (t < 0.5 ? 1.34 - 0.76 * t : 0.96 - 0.18 * (t - 0.5));
+    snare(v, { tones: [[179, head, 0.2], [332, head * 10 ** ((-15 + 22 * t) / 20), 0.07], [520, head * 0.4, 0.08]], noiseHp: 1500, noiseLp: 10000, noiseDecay: 0.18, noiseLevel: L * 4.2 * P('snappy') ** 2 });
   }],
   // Toms ~85/131/177 Hz, congas ~185/272/386 Hz at tuning 0.53; almost no sweep.
   lt: ['lt', pick(tom808(80, 0.57, 0.7), tom808(174, 0.45, 1.1))],
@@ -261,12 +299,13 @@ const R808 = {
   )],
   // Clap: broadband from ~800 Hz up, -20 dB after ~90 ms. Maracas: short noise above 8 kHz.
   cp: ['cp', pick(
-    (v, P) => clap(v, lvl(P('level')) * v.acc * 0.9, 1400, 0.3, 0.5, 0.5, 200),
+    // Its tail starts at the bursts' level (OpenRB-338 renders of ReBirth).
+    (v, P) => clap(v, lvl(P('level')) * v.acc * 1.5, 1400, 0.24, 0.5, 1.0, 450),
     (v, P) => shaker(v, { level: lvl(P('level')) * v.acc * 1.0, decay: 0.07, hp: 8000 }),
   )],
   // Centred near 810 Hz: a quick drop, then a ring that lasts ~0.8 s.
   cb: ['cb', (v, P) => {
-    const out = env2(v, lvl(P('level')) * v.acc * 0.6, 0.06, 0.18, 0.9);
+    const out = env2(v, lvl(P('level')) * v.acc * 0.8, 0.06, 0.18, 0.9);
     for (const hz of [540, 800]) {
       const o = osc(v, 'square', hz);
       chain(o, filter(v, 'bandpass', 1000, 1), out);
@@ -276,12 +315,20 @@ const R808 = {
   }],
   // Peaks near 7 kHz with real energy from ~1 kHz up; -20 dB after ~175 ms at
   // decay 100 and ~480 ms at 127, then a faint ring (-60 dB after ~6.8 s at 127).
+  // Refitted to OpenRB-338 renders of ReBirth: the sample drops ~12 dB in its first
+  // 100 ms, then fades slowly; the decay knob multiplies that by its own fade (time
+  // constant ~41 ms at 0, ~0.15 s at 64, none at the top). Most energy is at 5-14 kHz;
+  // tone takes out the mids and opens the top.
   cy: ['cy', (v, P) => {
-    const fast = stretch(P('decay'), 0.27, 0, 0.78);
-    cymbal(v, { level: lvl(P('level')) * v.acc * 1.0, decay: fast * 6.2, fast, tail: 0.06, scale: 1, hp: 2500 + P('tone') * 3000, bp: 7000 + P('tone') * 2000, noiseMix: 0.2 });
+    const d = Math.round(P('decay') * 127);
+    const fade = d >= 120 ? null : 0.041 * (0.15 / 0.041) ** (d / 63.5);
+    const t = P('tone');
+    cymbal(v, { level: lvl(P('level')) * v.acc * 3.0, decay: 2.2, fast: 0.15, tail: 0.25, fade, scale: 1, hp: 4500 + t * 1500, bp: 8000, lp: 14000 + t * 4000, noiseMix: 0.2 });
   }],
-  // -60 dB after ~0.45 s at decay 61 and ~4.3 s at 127.
-  oh: ['oh', (v, P) => hat(v, { level: lvl(P('level')) * v.acc * 1.1, decay: stretch(P('decay'), 0.15, 0.6, 3.6), bp: 8000, hp: 6000, chokeable: true })],
+  // ReBirth plays a ~0.55 s sample that fades ~27 dB/s on its own and holds it
+  // for 4 x decay blocks of 64 samples, then fades fast (OpenRB-338's notes on
+  // ReBirth.dll; levels fitted to OpenRB-338 renders).
+  oh: ['oh', (v, P) => hat(v, { level: lvl(P('level')) * v.acc * 1.75, decay: 0.32 / T60, hold: Math.min(OH808_SAMPLE, (4 * Math.round(P('decay') * 127) * 64) / 44100), bp: 8000, hp: 6000, chokeable: true })],
   // Brighter than the open hat (~12.6 kHz centroid), -20 dB after ~50 ms.
   ch: ['ch', (v, P) => hat(v, { level: lvl(P('level')) * v.acc * 4.4, decay: 0.1, bp: 11000, hp: 8000, choke: true })],
 };
@@ -289,13 +336,14 @@ const R808 = {
 // 909 voices fitted to isolated hits in ReBirth exports: a test song that plays
 // every voice alone with all effects off (knob sweeps for tunes and decays), and
 // earlier songs for centre settings.
+// Levels of BD, RS, CP and the cymbals raised 1.4-3.3 dB to OpenRB-338's renders of ReBirth.
 const R909 = {
   // The pitch always starts near 275 Hz and settles on 56 Hz; tune sets how long
   // the sweep takes (~5 ms at 0, ~11 ms at 64, ~30 ms from ~100 up). At 127 that's
   // ~115 Hz average over 20-60 ms and ~67 Hz over 60-120 ms. A weak second harmonic
   // carries the tail in the 100-200 Hz band. Decay (-60 dB) fitted between ~1.1 s
   // at 127 and ~0.7 s at 65. Attack 0 has no audible click.
-  bd: ['bd', (v, P) => kick(v, { base: 56, sweep: 4.9, settle: 0.005 + 0.025 * Math.min(1, P('tune') / 0.78) ** 2.5, decay: 0.25 + P('decay') * 0.85, level: lvl(P('level')) * v.acc * 0.75, click: 0.06 * P('attack') ** 0.45, clickHz: 7000, harm: 0.07 })],
+  bd: ['bd', (v, P) => kick(v, { base: 56, sweep: 4.9, settle: 0.005 + 0.025 * Math.min(1, P('tune') / 0.78) ** 2.5, decay: 0.25 + P('decay') * 0.85, level: lvl(P('level')) * v.acc * 0.98, click: 0.06 * P('attack') ** 0.45, clickHz: 7000, harm: 0.07 })],
   // Two sine heads a ratio of 1.35 apart, the lower 9 dB louder: ~122 Hz at tune 0,
   // 180 Hz at 64, 241 Hz at 127, starting ~1.3x higher. -20 dB after ~60 ms, then a
   // tail to ~0.45 s. A little noise even at snappy 0; snappy adds more, its
@@ -303,7 +351,11 @@ const R909 = {
   sd: ['sd', (v, P) => {
     const L = lvl(P('level')) * v.acc;
     const hz = 122 * (1 + 0.975 * P('tune') ** 1.1);
-    snare(v, { tones: [[hz, L * 1.05, 0.45, 0.06], [hz * 1.35, L * 0.37, 0.3, 0.06]], sweep: 1.3, noiseHp: 1200, noiseLp: 3000 + P('tone') * 9000, noiseDecay: 0.18, noiseLevel: L * (0.02 + P('snappy') * 0.45) });
+    // OpenRB-338's notes on ReBirth.dll: the snappy noise is its own sample, held for
+    // tone + 30 blocks of 64 samples, then faded; tone sets no brightness. Levels and
+    // spectrum fitted to OpenRB-338 renders (noise peaks at 5-9 kHz).
+    const hold = ((Math.round(P('tone') * 127) + 30) * 64) / 44100;
+    snare(v, { tones: [[hz, L * 1.45, 0.45, 0.06], [hz * 1.35, L * 0.5, 0.3, 0.06], [hz * 2.9, L * 0.3, 0.15]], sweep: 1.3, noiseHp: 2500, noiseLp: 8000, noiseDecay: 0.35, noiseHold: hold, noiseLevel: L * (0.02 + P('snappy') * 1.2) });
   }],
   // Toms ~95 / 118 / 128 Hz at tune 64, starting ~1.2x higher; -20 dB after
   // ~245 / ~170 / ~165 ms at max decay.
@@ -311,18 +363,18 @@ const R909 = {
   mt: ['mt', (v, P) => tom(v, { hz: 108 * (0.8 + P('tune') * 0.5), decay: 0.55 * (0.3 + P('decay') * 0.7), level: lvl(P('level')) * v.acc * 1.5, sweep: 1.2, sweepTime: 0.04, click: 0.12 })],
   ht: ['ht', (v, P) => tom(v, { hz: 122 * (0.8 + P('tune') * 0.5), decay: 0.5 * (0.3 + P('decay') * 0.7), level: lvl(P('level')) * v.acc * 1.9, sweep: 1.3, sweepTime: 0.05, click: 0.12 })],
   // Rimshot: a short click peaking ~220 Hz with a broad top, -20 dB after ~25 ms.
-  rs: ['rs', (v, P) => ring(v, { partials: [[221, 1], [480, 0.45], [1000, 0.2], [1700, 0.1]], decay: 0.07, level: lvl(P('level')) * v.acc * 1.1, tick: 0.25 })],
+  rs: ['rs', (v, P) => ring(v, { partials: [[221, 1], [480, 0.45], [1000, 0.2], [1700, 0.1]], decay: 0.07, level: lvl(P('level')) * v.acc * 1.3, tick: 0.25 })],
   // Clap centred near 900 Hz, little below 600 Hz. The tail starts ~18 dB under
   // the bursts and fades over ~0.8 s.
-  cp: ['cp', (v, P) => clap(v, lvl(P('level')) * v.acc * 6.5, 1100, 0.75, 1.3, 0.12)],
+  cp: ['cp', (v, P) => clap(v, lvl(P('level')) * v.acc * 9.5, 1100, 0.75, 1.3, 0.12)],
   // The 909's sampled hats are broadband (flat ~4-13 kHz in ReBirth recordings):
   // mostly high-passed noise with a lighter metallic layer.
   // Decays (-60 dB) ~0.28 s (closed) and ~0.85 s (open) at 127; peaks 5-8 kHz.
   ch: ['hh', (v, P) => hat(v, { level: lvl(P('level')) * v.acc * 1.05, decay: 0.03 + P('chDecay') * 0.25, scale: 1.3, hp: 2400, lp: 11000, noiseMix: 1, metalMix: 0.35, choke: true })],
   oh: ['hh', (v, P) => hat(v, { level: lvl(P('level')) * v.acc * 0.85, decay: 0.25 + P('ohDecay') * 0.6, scale: 1.3, hp: 2600, lp: 12000, noiseMix: 1, metalMix: 0.35, chokeable: true })],
   // Cymbals ring ~2 s with energy from ~600 Hz up.
-  cr: ['cy', (v, P) => cymbal(v, { level: lvl(P('crLevel')) * v.acc * 0.7, decay: 2.1, scale: 1.7 * (0.7 + P('crTune') * 0.6), hp: 1500, bp: 5000, noiseMix: 0.5 })],
-  rd: ['cy', (v, P) => cymbal(v, { level: lvl(P('rdLevel')) * v.acc * 1.2, decay: 2.0, scale: 2.3 * (0.7 + P('rdTune') * 0.6), hp: 2500, bp: 8000, noiseMix: 0.15 })],
+  cr: ['cy', (v, P) => cymbal(v, { level: lvl(P('crLevel')) * v.acc * 0.87, decay: 2.1, scale: 1.7 * (0.7 + P('crTune') * 0.6), hp: 1500, bp: 5000, noiseMix: 0.5 })],
+  rd: ['cy', (v, P) => cymbal(v, { level: lvl(P('rdLevel')) * v.acc * 1.53, decay: 2.0, scale: 2.3 * (0.7 + P('rdTune') * 0.6), hp: 2500, bp: 8000, noiseMix: 0.15 })],
 };
 
 // track id -> [knob group id, voice]
